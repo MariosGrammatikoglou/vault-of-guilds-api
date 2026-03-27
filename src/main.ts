@@ -8,19 +8,29 @@ import * as express from 'express';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule, {
-    cors: { origin: config.corsOrigin || '*' },
+    cors: {
+      origin: config.corsOrigin || '*',
+      credentials: true,
+    },
   });
 
-  // WebSocket driver
   app.useWebSocketAdapter(new IoAdapter(app));
 
-  // Serve uploaded files
   const uploadsDir = path.join(process.cwd(), 'uploads');
   app.use('/uploads', express.static(uploadsDir));
 
-  app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }));
-  await app.listen(3000);
-  console.log('✅ API running at http://localhost:3000');
+  app.useGlobalPipes(
+    new ValidationPipe({
+      whitelist: true,
+      transform: true,
+    }),
+  );
+
+  const port = Number(process.env.PORT) || 3000;
+  await app.listen(port, '0.0.0.0');
+
+  console.log(`✅ API running on port ${port}`);
   console.log('📦 Static uploads served at /uploads');
 }
+
 bootstrap();
