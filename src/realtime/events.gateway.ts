@@ -13,6 +13,7 @@ import { PresenceService } from '../presence/presence.service';
 import { RolesService } from '../roles/roles.service';
 import { PERMS } from '../roles/permissions';
 import { MessagesService } from '../messages/messages.service';
+import { DmService } from '../dm/dm.service';
 
 type AuthedSocket = Socket & { user?: { id: string; username: string } };
 
@@ -41,6 +42,7 @@ export class EventsGateway
     private presence: PresenceService,
     private roles: RolesService,
     private messages: MessagesService,
+    private dmService: DmService,
   ) {}
 
   afterInit() {
@@ -113,6 +115,7 @@ export class EventsGateway
       client.user = { id: decoded.sub, username: decoded.username };
 
       this.presence.userConnected(client.user.id, client.id);
+      client.join(`user:${client.user.id}`);
 
       const sv = await this.db.query<{ server_id: string }>(
         'SELECT server_id FROM server_members WHERE user_id = $1',
@@ -363,6 +366,80 @@ export class EventsGateway
 
       client.on('voice:candidate', ({ to, candidate }) => {
         this.io.to(to).emit('voice:candidate', { from: client.id, candidate });
+      });
+
+      // ── DM ──────────────────────────────────────────────────────────────
+      client.on('dm:subscribe', ({ channelId }) => {
+        if (!channelId) return;
+        void client.join(`dm:${channelId}`);
+      });
+
+      client.on('dm:unsubscribe', ({ channelId }) => {
+        if (!channelId) return;
+        void client.leave(`dm:${channelId}`);
+      });
+
+      client.on('dm:send', async ({ channelId, content }, cb) => {
+        try {
+          if (!client.user) { cb?.({ ok: false, error: 'Not authenticated' }); return; }
+          const msg = await this.dmService.sendMessage(channelId, client.user.id, content);
+          client.to(`dm:${channelId}`).emit('dm:new', msg);
+          const ch = await this.dmService.getChannelUsers(channelId);
+          if (ch) {
+            const otherId = ch.user1_id === client.user.id ? ch.user2_id : ch.user1_id;
+            this.io.to(`user:${otherId}`).emit('dm:notify', { channelId, from: client.user.username });
+          }
+          cb?.({ ok: true, msg });
+        } catch (e: any) {
+          cb?.({ ok: false, error: e?.message || 'Unable to send DM' });
+        }
+      });
+
+      // ── Screen sharing ───────────────────────────────────────────────────
+      client.on('screen:start', ({ channelId }) => {
+        const member = this.voiceMembers.get(client.id);
+        if (!member || member.channelId !== channelId) return;
+        client.to(this.roomForVoice(channelId)).emit('screen:start', {
+          socketId: client.id,
+          userId: member.userId,
+          username: member.username,
+          channelId,
+        });
+        this.io.to(this.roomForPresence(member.serverId)).emit('screen:start', {
+          socketId: client.id,
+          userId: member.userId,
+          username: member.username,
+          channelId,
+        });
+      });
+
+      client.on('screen:stop', ({ channelId }) => {
+        const member = this.voiceMembers.get(client.id);
+        if (!member) return;
+        client.to(this.roomForVoice(channelId)).emit('screen:stop', {
+          socketId: client.id,
+          userId: member.userId,
+          username: member.username,
+          channelId,
+        });
+        this.io.to(this.roomForPresence(member.serverId)).emit('screen:stop', {
+          socketId: client.id,
+          userId: member.userId,
+          username: member.username,
+          channelId,
+        });
+      });
+
+      client.on('screen:offer', ({ to, sdp }) => {
+        this.io.to(to).emit('screen:offer', { from: client.id, sdp });
+      });
+
+      client.on('screen:answer', ({ to, sdp }) => {
+        this.io.to(to).emit('screen:answer', { from: client.id, sdp });
+      });
+
+      client.on('screen:candidate', ({ to, candidate }) => {
+        this.io.to(to).emit('screen:candidate', { from: client.id, candidate });
       });
 
       client.emit('connected', { ok: true });

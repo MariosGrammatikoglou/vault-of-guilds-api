@@ -8,6 +8,7 @@ import { MessagesModule } from './messages/messages.module';
 import { RealtimeModule } from './realtime/realtime.module';
 import { RolesModule } from './roles/roles.module';
 import { PresenceModule } from './presence/presence.module';
+import { DmModule } from './dm/dm.module';
 
 @Module({
   imports: [
@@ -20,6 +21,7 @@ import { PresenceModule } from './presence/presence.module';
     RealtimeModule,
     RolesModule,
     PresenceModule,
+    DmModule,
   ],
 })
 export class AppModule {}
