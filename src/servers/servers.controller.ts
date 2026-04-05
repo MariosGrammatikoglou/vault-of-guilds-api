@@ -14,17 +14,11 @@ import { JwtAuthGuard } from 'src/auth/jwt.guard';
 import { ServersService } from './servers.service';
 import { PresenceService } from '../presence/presence.service';
 import { FileInterceptor } from '@nestjs/platform-express';
-import { diskStorage } from 'multer';
-import * as path from 'node:path';
-import * as fs from 'node:fs';
+import { memoryStorage } from 'multer';
 import type { Multer } from 'multer';
 
 type CreateServerBody = { name: string };
 type JoinServerBody = { serverId?: string; code?: string };
-
-function ensureUploadsDir(dir: string) {
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-}
 
 @UseGuards(JwtAuthGuard)
 @Controller('servers')
@@ -80,19 +74,7 @@ export class ServersController {
   @Post(':serverId/icon')
   @UseInterceptors(
     FileInterceptor('file', {
-      storage: diskStorage({
-        destination: (_req, _file, cb) => {
-          const dir = path.join(process.cwd(), 'uploads', 'server-icons');
-          ensureUploadsDir(dir);
-          cb(null, dir);
-        },
-        filename: (_req, file, cb) => {
-          const ext =
-            path.extname(file.originalname || '').toLowerCase() || '.png';
-          const base = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-          cb(null, `${base}${ext}`);
-        },
-      }),
+      storage: memoryStorage(),
       limits: { fileSize: 2 * 1024 * 1024 },
     }),
   )
@@ -102,11 +84,13 @@ export class ServersController {
     @UploadedFile() file: Multer.File,
   ) {
     if (!file) throw new ForbiddenException('No file uploaded');
-    const publicUrl = `/uploads/server-icons/${file.filename}`;
+    // Store as base64 data URL in the DB so it persists across server restarts
+    const mime = file.mimetype || 'image/png';
+    const dataUrl = `data:${mime};base64,${file.buffer.toString('base64')}`;
     const updated = await this.servers.setIconUrl(
       serverId,
       req.user.sub,
-      publicUrl,
+      dataUrl,
     );
     return { ok: true, server: updated };
   }

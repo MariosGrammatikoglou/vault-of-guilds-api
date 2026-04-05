@@ -151,7 +151,9 @@ export class EventsGateway
             client.user!.id,
             content,
           );
-          cb?.({ ok: true, id: msg.id });
+          // Emit directly (don't rely only on pg NOTIFY for mobile reliability)
+          await this.emitMessageNew(msg);
+          cb?.({ ok: true, id: msg.id, msg });
         } catch (e: any) {
           cb?.({ ok: false, error: e?.message || 'Unable to send message' });
         }
