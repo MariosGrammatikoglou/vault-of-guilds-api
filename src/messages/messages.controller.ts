@@ -2,14 +2,17 @@ import {
   Controller,
   Get,
   Post,
+  Patch,
+  Delete,
   Query,
   Req,
   UseGuards,
   Body,
+  Param,
 } from '@nestjs/common';
 import { JwtAuthGuard } from 'src/auth/jwt.guard';
 import { MessagesService } from './messages.service';
-import { SendMessageDto } from './dto';
+import { SendMessageDto, EditMessageDto, AddReactionDto } from './dto';
 
 @UseGuards(JwtAuthGuard)
 @Controller('messages')
@@ -34,5 +37,33 @@ export class MessagesController {
       : 20;
 
     return this.messages.list(channelId, req.user.sub, safeLimit, before);
+  }
+
+  @Patch(':id')
+  edit(@Req() req: any, @Param('id') id: string, @Body() dto: EditMessageDto) {
+    return this.messages.edit(id, req.user.sub, dto.content);
+  }
+
+  @Delete(':id')
+  remove(@Req() req: any, @Param('id') id: string) {
+    return this.messages.delete(id, req.user.sub);
+  }
+
+  @Post(':id/reactions')
+  addReaction(
+    @Req() req: any,
+    @Param('id') id: string,
+    @Body() dto: AddReactionDto,
+  ) {
+    return this.messages.addReaction(id, req.user.sub, dto.emoji);
+  }
+
+  @Delete(':id/reactions/:emoji')
+  removeReaction(
+    @Req() req: any,
+    @Param('id') id: string,
+    @Param('emoji') emoji: string,
+  ) {
+    return this.messages.removeReaction(id, req.user.sub, emoji);
   }
 }

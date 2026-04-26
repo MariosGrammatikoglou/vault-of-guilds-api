@@ -27,6 +27,9 @@ type VoiceMember = {
   muted: boolean;
 };
 
+// userId -> { username, timer }
+type TypingEntry = { username: string; timer: ReturnType<typeof setTimeout> };
+
 @WebSocketGateway({
   cors: { origin: config.corsOrigin || '*' },
 })
@@ -36,6 +39,8 @@ export class EventsGateway
   @WebSocketServer() io!: Server;
 
   private voiceMembers = new Map<string, VoiceMember>();
+  // channelId -> (userId -> TypingEntry)
+  private typingUsers = new Map<string, Map<string, TypingEntry>>();
 
   constructor(
     private db: PgService,
@@ -70,9 +75,7 @@ export class EventsGateway
     return `voice:${channelId}`;
   }
 
-  private async getServerIdForChannel(
-    channelId: string,
-  ): Promise<string | null> {
+  private async getServerIdForChannel(channelId: string): Promise<string | null> {
     const [row] = await this.db.query<{ server_id: string }>(
       'SELECT server_id FROM channels WHERE id = $1',
       [channelId],
@@ -98,9 +101,80 @@ export class EventsGateway
       channelId,
       members: this.getVoiceMembersForChannel(channelId),
     };
-
     this.io.to(this.roomForVoice(channelId)).emit('voice:members', payload);
     this.io.to(this.roomForPresence(serverId)).emit('voice:members', payload);
+  }
+
+  // ── Typing helpers ────────────────────────────────────────────────────────
+
+  private setTyping(channelId: string, userId: string, username: string) {
+    if (!this.typingUsers.has(channelId)) {
+      this.typingUsers.set(channelId, new Map());
+    }
+    const map = this.typingUsers.get(channelId)!;
+    const existing = map.get(userId);
+    if (existing) clearTimeout(existing.timer);
+
+    const timer = setTimeout(() => {
+      this.clearTyping(channelId, userId);
+    }, 4000);
+
+    map.set(userId, { username, timer });
+    this.broadcastTyping(channelId);
+  }
+
+  private clearTyping(channelId: string, userId: string) {
+    const map = this.typingUsers.get(channelId);
+    if (!map) return;
+    const entry = map.get(userId);
+    if (entry) clearTimeout(entry.timer);
+    map.delete(userId);
+    if (map.size === 0) this.typingUsers.delete(channelId);
+    this.broadcastTyping(channelId);
+  }
+
+  private broadcastTyping(channelId: string) {
+    const map = this.typingUsers.get(channelId);
+    const users = map ? Array.from(map.values()).map((e) => e.username) : [];
+    this.io
+      .to(this.roomForChannel(channelId))
+      .emit('typing:update', { channelId, users });
+  }
+
+  // ── Mention helper ────────────────────────────────────────────────────────
+
+  private async notifyMentions(
+    content: string,
+    serverId: string,
+    channelId: string,
+    messageId: string,
+    fromUsername: string,
+    fromUserId: string,
+  ) {
+    const mentionedNames = Array.from(
+      new Set(
+        (content.match(/@(\w+)/g) ?? []).map((m) => m.slice(1).toLowerCase()),
+      ),
+    );
+    if (mentionedNames.length === 0) return;
+
+    const rows = await this.db.query<{ id: string; username: string }>(
+      `SELECT u.id, u.username FROM users u
+       JOIN server_members sm ON sm.user_id = u.id
+       WHERE sm.server_id = $1
+         AND lower(u.username) = ANY($2)
+         AND u.id != $3`,
+      [serverId, mentionedNames, fromUserId],
+    );
+
+    for (const row of rows) {
+      this.io.to(`user:${row.id}`).emit('mention:notify', {
+        channelId,
+        messageId,
+        from: fromUsername,
+        content,
+      });
+    }
   }
 
   async handleConnection(client: AuthedSocket) {
@@ -144,6 +218,7 @@ export class EventsGateway
         client.emit('unsubscribed', { channelId });
       });
 
+      // ── Message send ───────────────────────────────────────────────────────
       client.on('message:send', async ({ channelId, content }, cb) => {
         try {
           const msg = await this.messages.send(
@@ -151,14 +226,113 @@ export class EventsGateway
             client.user!.id,
             content,
           );
-          // Emit directly (don't rely only on pg NOTIFY for mobile reliability)
           await this.emitMessageNew(msg);
+          // Clear typing when they send
+          this.clearTyping(channelId, client.user!.id);
+          // @mention notifications
+          void this.notifyMentions(
+            content,
+            msg.server_id,
+            channelId,
+            msg.id,
+            client.user!.username,
+            client.user!.id,
+          );
           cb?.({ ok: true, id: msg.id, msg });
         } catch (e: any) {
           cb?.({ ok: false, error: e?.message || 'Unable to send message' });
         }
       });
 
+      // ── Typing ─────────────────────────────────────────────────────────────
+      client.on('typing:start', ({ channelId }) => {
+        if (!channelId || !client.user) return;
+        this.setTyping(channelId, client.user.id, client.user.username);
+      });
+
+      client.on('typing:stop', ({ channelId }) => {
+        if (!channelId || !client.user) return;
+        this.clearTyping(channelId, client.user.id);
+      });
+
+      // ── Message edit (via socket) ──────────────────────────────────────────
+      client.on('message:edit', async ({ messageId, content }, cb) => {
+        try {
+          const updated = await this.messages.edit(
+            messageId,
+            client.user!.id,
+            content,
+          );
+          this.io
+            .to(this.roomForChannel(updated.channel_id))
+            .emit('message:edited', {
+              id: updated.id,
+              channel_id: updated.channel_id,
+              content: updated.content,
+              edited_at: updated.edited_at,
+            });
+          cb?.({ ok: true });
+        } catch (e: any) {
+          cb?.({ ok: false, error: e?.message || 'Unable to edit' });
+        }
+      });
+
+      // ── Message delete (via socket) ────────────────────────────────────────
+      client.on('message:delete', async ({ messageId }, cb) => {
+        try {
+          const result = await this.messages.delete(
+            messageId,
+            client.user!.id,
+          );
+          this.io
+            .to(this.roomForChannel(result.channel_id))
+            .emit('message:deleted', {
+              id: result.id,
+              channel_id: result.channel_id,
+            });
+          cb?.({ ok: true });
+        } catch (e: any) {
+          cb?.({ ok: false, error: e?.message || 'Unable to delete' });
+        }
+      });
+
+      // ── Reaction toggle (via socket) ───────────────────────────────────────
+      client.on('reaction:toggle', async ({ messageId, emoji }, cb) => {
+        try {
+          const existing = await this.db.query(
+            'SELECT 1 FROM message_reactions WHERE message_id = $1 AND user_id = $2 AND emoji = $3',
+            [messageId, client.user!.id, emoji],
+          );
+
+          let result: any;
+          if (existing.length > 0) {
+            result = await this.messages.removeReaction(messageId, client.user!.id, emoji);
+          } else {
+            result = await this.messages.addReaction(messageId, client.user!.id, emoji);
+          }
+
+          // Broadcast WITHOUT reacted flag — each client computes it from user_ids
+          const broadcastReactions = result.reactions.map((r: any) => ({
+            emoji: r.emoji,
+            count: r.count,
+            user_ids: r.user_ids,
+          }));
+
+          this.io
+            .to(this.roomForChannel(result.channelId))
+            .emit('reaction:update', {
+              messageId: result.messageId,
+              channelId: result.channelId,
+              reactions: broadcastReactions,
+            });
+
+          cb?.({ ok: true });
+        } catch (e: any) {
+          cb?.({ ok: false, error: e?.message || 'Unable to react' });
+        }
+      });
+
+      // ── Voice ──────────────────────────────────────────────────────────────
       client.on('voice:join', async ({ channelId }, cb) => {
         try {
           if (!channelId || !client.user) {
@@ -176,16 +350,12 @@ export class EventsGateway
           if (existing) {
             client.leave(this.roomForVoice(existing.channelId));
             this.voiceMembers.delete(client.id);
-
-            this.io
-              .to(this.roomForVoice(existing.channelId))
-              .emit('voice:user-left', {
-                socketId: client.id,
-                userId: existing.userId,
-                username: existing.username,
-                channelId: existing.channelId,
-              });
-
+            this.io.to(this.roomForVoice(existing.channelId)).emit('voice:user-left', {
+              socketId: client.id,
+              userId: existing.userId,
+              username: existing.username,
+              channelId: existing.channelId,
+            });
             this.emitVoiceMembers(existing.channelId, existing.serverId);
           }
 
@@ -219,7 +389,6 @@ export class EventsGateway
 
       client.on('voice:leave', ({ channelId }) => {
         if (!channelId) return;
-
         const existing = this.voiceMembers.get(client.id);
         if (!existing || existing.channelId !== channelId) return;
 
@@ -232,14 +401,12 @@ export class EventsGateway
           username: existing.username,
           channelId,
         });
-
         this.emitVoiceMembers(channelId, existing.serverId);
       });
 
       client.on('voice:speaking', ({ channelId, speaking }) => {
         const existing = this.voiceMembers.get(client.id);
-        if (!existing) return;
-        if (existing.channelId !== channelId) return;
+        if (!existing || existing.channelId !== channelId) return;
 
         existing.speaking = !!speaking && !existing.muted;
         this.voiceMembers.set(client.id, existing);
@@ -252,18 +419,13 @@ export class EventsGateway
           speaking: existing.speaking,
         };
 
-        this.io
-          .to(this.roomForVoice(channelId))
-          .emit('voice:speaking', payload);
-        this.io
-          .to(this.roomForPresence(existing.serverId))
-          .emit('voice:speaking', payload);
+        this.io.to(this.roomForVoice(channelId)).emit('voice:speaking', payload);
+        this.io.to(this.roomForPresence(existing.serverId)).emit('voice:speaking', payload);
       });
 
       client.on('voice:mute', ({ channelId, muted }) => {
         const existing = this.voiceMembers.get(client.id);
-        if (!existing) return;
-        if (existing.channelId !== channelId) return;
+        if (!existing || existing.channelId !== channelId) return;
 
         existing.muted = !!muted;
         if (existing.muted) existing.speaking = false;
@@ -277,12 +439,8 @@ export class EventsGateway
           muted: existing.muted,
         };
 
-        this.io
-          .to(this.roomForVoice(channelId))
-          .emit('voice:mute', mutePayload);
-        this.io
-          .to(this.roomForPresence(existing.serverId))
-          .emit('voice:mute', mutePayload);
+        this.io.to(this.roomForVoice(channelId)).emit('voice:mute', mutePayload);
+        this.io.to(this.roomForPresence(existing.serverId)).emit('voice:mute', mutePayload);
 
         if (existing.muted) {
           const speakingPayload = {
@@ -292,71 +450,50 @@ export class EventsGateway
             username: existing.username,
             speaking: false,
           };
-
-          this.io
-            .to(this.roomForVoice(channelId))
-            .emit('voice:speaking', speakingPayload);
-
-          this.io
-            .to(this.roomForPresence(existing.serverId))
-            .emit('voice:speaking', speakingPayload);
+          this.io.to(this.roomForVoice(channelId)).emit('voice:speaking', speakingPayload);
+          this.io.to(this.roomForPresence(existing.serverId)).emit('voice:speaking', speakingPayload);
         }
 
         this.emitVoiceMembers(channelId, existing.serverId);
       });
 
-      client.on(
-        'voice:force-disconnect',
-        async ({ serverId, targetUserId }, cb) => {
-          try {
-            if (!client.user || !serverId || !targetUserId) {
-              cb?.({ ok: false, error: 'Missing data' });
-              return;
-            }
-
-            await this.roles.ensurePerm(
-              serverId,
-              client.user.id,
-              PERMS.KICK_MEMBERS,
-            );
-
-            const targets = Array.from(this.voiceMembers.values()).filter(
-              (m) => m.userId === targetUserId && m.serverId === serverId,
-            );
-
-            for (const target of targets) {
-              const sock = this.io.sockets.sockets.get(target.socketId);
-              if (sock) {
-                sock.emit('voice:disconnect', {
-                  channelId: target.channelId,
-                  reason: 'Disconnected by moderator',
-                });
-                sock.leave(this.roomForVoice(target.channelId));
-              }
-
-              this.voiceMembers.delete(target.socketId);
-
-              this.io
-                .to(this.roomForVoice(target.channelId))
-                .emit('voice:user-left', {
-                  socketId: target.socketId,
-                  userId: target.userId,
-                  username: target.username,
-                  channelId: target.channelId,
-                });
-
-              this.emitVoiceMembers(target.channelId, target.serverId);
-            }
-
-            cb?.({ ok: true });
-          } catch (e: any) {
-            cb?.({
-              ok: false,
-              error: e?.message || 'Unable to disconnect user',
-            });
+      client.on('voice:force-disconnect', async ({ serverId, targetUserId }, cb) => {
+        try {
+          if (!client.user || !serverId || !targetUserId) {
+            cb?.({ ok: false, error: 'Missing data' });
+            return;
           }
-        },
-      );
+
+          await this.roles.ensurePerm(serverId, client.user.id, PERMS.KICK_MEMBERS);
+
+          const targets = Array.from(this.voiceMembers.values()).filter(
+            (m) => m.userId === targetUserId && m.serverId === serverId,
+          );
+
+          for (const target of targets) {
+            const sock = this.io.sockets.sockets.get(target.socketId);
+            if (sock) {
+              sock.emit('voice:disconnect', {
+                channelId: target.channelId,
+                reason: 'Disconnected by moderator',
+              });
+              sock.leave(this.roomForVoice(target.channelId));
+            }
+            this.voiceMembers.delete(target.socketId);
+            this.io.to(this.roomForVoice(target.channelId)).emit('voice:user-left', {
+              socketId: target.socketId,
+              userId: target.userId,
+              username: target.username,
+              channelId: target.channelId,
+            });
+            this.emitVoiceMembers(target.channelId, target.serverId);
+          }
+
+          cb?.({ ok: true });
+        } catch (e: any) {
+          cb?.({ ok: false, error: e?.message || 'Unable to disconnect user' });
+        }
+      });
 
       client.on('voice:offer', ({ to, sdp }) => {
         this.io.to(to).emit('voice:offer', { from: client.id, sdp });
@@ -370,7 +507,7 @@ export class EventsGateway
         this.io.to(to).emit('voice:candidate', { from: client.id, candidate });
       });
 
-      // ── DM ──────────────────────────────────────────────────────────────
+      // ── DM ────────────────────────────────────────────────────────────────
       client.on('dm:subscribe', ({ channelId }) => {
         if (!channelId) return;
         void client.join(`dm:${channelId}`);
@@ -397,7 +534,7 @@ export class EventsGateway
         }
       });
 
-      // ── Screen sharing ───────────────────────────────────────────────────
+      // ── Screen sharing ─────────────────────────────────────────────────────
       client.on('screen:start', ({ channelId }) => {
         const member = this.voiceMembers.get(client.id);
         if (!member || member.channelId !== channelId) return;
@@ -453,6 +590,19 @@ export class EventsGateway
   async handleDisconnect(client: AuthedSocket) {
     this.presence.userDisconnected(client.id);
 
+    if (client.user) {
+      // Clear typing from all channels on disconnect
+      for (const [channelId, map] of this.typingUsers.entries()) {
+        if (map.has(client.user.id)) {
+          const entry = map.get(client.user.id)!;
+          clearTimeout(entry.timer);
+          map.delete(client.user.id);
+          if (map.size === 0) this.typingUsers.delete(channelId);
+          this.broadcastTyping(channelId);
+        }
+      }
+    }
+
     try {
       if (!client.user) return;
 
@@ -474,14 +624,12 @@ export class EventsGateway
     const existing = this.voiceMembers.get(client.id);
     if (existing) {
       this.voiceMembers.delete(client.id);
-
       client.to(this.roomForVoice(existing.channelId)).emit('voice:user-left', {
         socketId: client.id,
         userId: existing.userId,
         username: existing.username,
         channelId: existing.channelId,
       });
-
       this.emitVoiceMembers(existing.channelId, existing.serverId);
     }
   }

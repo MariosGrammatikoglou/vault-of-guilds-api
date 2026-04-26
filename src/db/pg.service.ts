@@ -16,6 +16,23 @@ export class PgService implements OnModuleInit, OnModuleDestroy {
       this.handlers.forEach((h) => h(msg.channel, msg.payload || ''));
     });
     await this.listener.query('LISTEN message_inserted');
+    await this.runMigrations();
+  }
+
+  private async runMigrations() {
+    await this.pool.query(
+      `ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ`,
+    );
+    await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS message_reactions (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        message_id UUID NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        emoji TEXT NOT NULL CHECK(length(emoji) <= 12),
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(message_id, user_id, emoji)
+      )
+    `);
   }
 
   onModuleDestroy() {
