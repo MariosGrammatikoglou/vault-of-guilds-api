@@ -8,7 +8,7 @@ import {
 import { PgService } from '../db/pg.service';
 import { generateInviteCode, matchesCode } from './invite.util';
 import { RolesService } from '../roles/roles.service';
-import { PERMS } from '../roles/permissions';
+import { PERMS, ALL_PERMS } from '../roles/permissions';
 
 type ServerRow = {
   id: string;
@@ -37,14 +37,24 @@ export class ServersService {
       [s.id, ownerId, 'owner'],
     );
 
-    // Create default Member role with SEND_MESSAGES permission
+    // Create default Admin role (all permissions) and Member role (send messages only)
+    const [adminRole] = await this.db.query<{ id: string }>(
+      `INSERT INTO server_roles (server_id, name, color, permissions, position)
+       VALUES ($1, 'Admin', '#f97316', $2, 10) RETURNING id`,
+      [s.id, ALL_PERMS],
+    );
     const [memberRole] = await this.db.query<{ id: string }>(
       `INSERT INTO server_roles (server_id, name, color, permissions, position)
        VALUES ($1, 'Member', '#99AAB5', $2, 1) RETURNING id`,
       [s.id, PERMS.SEND_MESSAGES],
     );
 
-    // Assign Member role to owner
+    // Assign Admin + Member roles to owner
+    await this.db.query(
+      `INSERT INTO server_member_roles (server_id, user_id, role_id)
+       VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+      [s.id, ownerId, adminRole.id],
+    );
     await this.db.query(
       `INSERT INTO server_member_roles (server_id, user_id, role_id)
        VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
@@ -68,6 +78,12 @@ export class ServersService {
   }
 
   async join(serverId: string, userId: string): Promise<{ ok: true }> {
+    const [banned] = await this.db.query(
+      'SELECT 1 FROM server_bans WHERE server_id=$1 AND user_id=$2',
+      [serverId, userId],
+    );
+    if (banned) throw new ForbiddenException('You are banned from this server');
+
     await this.db.query(
       'INSERT INTO server_members (server_id, user_id, role) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING',
       [serverId, userId, 'member'],
@@ -249,5 +265,72 @@ export class ServersService {
     );
 
     return { ok: true };
+  }
+
+  async banMember(
+    serverId: string,
+    actorId: string,
+    targetUserId: string,
+    reason?: string,
+  ) {
+    await this.ensureMember(serverId, actorId);
+
+    const [server] = await this.db.query<{ owner_id: string }>(
+      'SELECT owner_id FROM servers WHERE id=$1',
+      [serverId],
+    );
+    if (!server) throw new NotFoundException('Server not found');
+    if (server.owner_id === targetUserId)
+      throw new ForbiddenException('Cannot ban the server owner');
+    if (actorId === targetUserId)
+      throw new ForbiddenException('Cannot ban yourself');
+
+    await this.rolesService.ensurePerm(serverId, actorId, PERMS.BAN_MEMBERS);
+
+    // Remove from server
+    await this.db.query(
+      'DELETE FROM server_member_roles WHERE server_id=$1 AND user_id=$2',
+      [serverId, targetUserId],
+    );
+    await this.db.query(
+      'DELETE FROM server_members WHERE server_id=$1 AND user_id=$2',
+      [serverId, targetUserId],
+    );
+
+    // Record ban
+    await this.db.query(
+      `INSERT INTO server_bans (server_id, user_id, banned_by, reason)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (server_id, user_id) DO UPDATE SET reason=EXCLUDED.reason, banned_by=EXCLUDED.banned_by`,
+      [serverId, targetUserId, actorId, reason ?? null],
+    );
+
+    return { ok: true };
+  }
+
+  async unbanMember(serverId: string, actorId: string, targetUserId: string) {
+    await this.rolesService.ensurePerm(serverId, actorId, PERMS.BAN_MEMBERS);
+    await this.db.query(
+      'DELETE FROM server_bans WHERE server_id=$1 AND user_id=$2',
+      [serverId, targetUserId],
+    );
+    return { ok: true };
+  }
+
+  async listBans(serverId: string, actorId: string) {
+    await this.ensureMember(serverId, actorId);
+    return this.db.query<{
+      user_id: string;
+      username: string;
+      reason: string | null;
+      created_at: string;
+    }>(
+      `SELECT b.user_id, u.username, b.reason, b.created_at
+         FROM server_bans b
+         JOIN users u ON u.id = b.user_id
+        WHERE b.server_id = $1
+        ORDER BY b.created_at DESC`,
+      [serverId],
+    );
   }
 }

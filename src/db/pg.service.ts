@@ -36,6 +36,26 @@ export class PgService implements OnModuleInit, OnModuleDestroy {
         UNIQUE(message_id, user_id, emoji)
       )
     `);
+    await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS server_bans (
+        server_id UUID NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        banned_by UUID REFERENCES users(id) ON DELETE SET NULL,
+        reason TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        PRIMARY KEY (server_id, user_id)
+      )
+    `);
+
+    // Run immediately then every 24 hours
+    void this.deleteOldMessages();
+    setInterval(() => void this.deleteOldMessages(), 24 * 60 * 60 * 1000);
+  }
+
+  private async deleteOldMessages() {
+    await this.pool.query(
+      `DELETE FROM messages WHERE created_at < NOW() - INTERVAL '30 days'`,
+    );
   }
 
   onModuleDestroy() {

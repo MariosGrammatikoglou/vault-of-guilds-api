@@ -120,4 +120,31 @@ export class ServersController {
   ) {
     return this.servers.transferOwnership(serverId, req.user.sub, userId);
   }
+
+  @Post(':serverId/ban/:userId')
+  async banMember(
+    @Req() req: { user: { sub: string } },
+    @Param('serverId') serverId: string,
+    @Param('userId') userId: string,
+    @Body() body: { reason?: string },
+  ) {
+    return this.servers.banMember(serverId, req.user.sub, userId, body.reason);
+  }
+
+  @Post(':serverId/unban/:userId')
+  async unbanMember(
+    @Req() req: { user: { sub: string } },
+    @Param('serverId') serverId: string,
+    @Param('userId') userId: string,
+  ) {
+    return this.servers.unbanMember(serverId, req.user.sub, userId);
+  }
+
+  @Get(':serverId/bans')
+  async listBans(
+    @Req() req: { user: { sub: string } },
+    @Param('serverId') serverId: string,
+  ) {
+    return this.servers.listBans(serverId, req.user.sub);
+  }
 }

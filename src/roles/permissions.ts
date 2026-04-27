@@ -4,6 +4,7 @@ export const PERMS = {
   SEND_MESSAGES: 1 << 2,
   CONNECT_VOICE: 1 << 3,
   KICK_MEMBERS: 1 << 4,
+  BAN_MEMBERS: 1 << 5,
 } as const;
 
 export type PermName = keyof typeof PERMS;
@@ -17,4 +18,5 @@ export const ALL_PERMS =
   PERMS.MANAGE_CHANNELS |
   PERMS.SEND_MESSAGES |
   PERMS.CONNECT_VOICE |
-  PERMS.KICK_MEMBERS;
+  PERMS.KICK_MEMBERS |
+  PERMS.BAN_MEMBERS;
