@@ -21,6 +21,9 @@ export class PgService implements OnModuleInit, OnModuleDestroy {
 
   private async runMigrations() {
     await this.pool.query(
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS display_color TEXT`,
+    );
+    await this.pool.query(
       `ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ`,
     );
     await this.pool.query(`

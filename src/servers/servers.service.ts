@@ -37,7 +37,34 @@ export class ServersService {
       [s.id, ownerId, 'owner'],
     );
 
+    // Create default Member role with SEND_MESSAGES permission
+    const [memberRole] = await this.db.query<{ id: string }>(
+      `INSERT INTO server_roles (server_id, name, color, permissions, position)
+       VALUES ($1, 'Member', '#99AAB5', $2, 1) RETURNING id`,
+      [s.id, PERMS.SEND_MESSAGES],
+    );
+
+    // Assign Member role to owner
+    await this.db.query(
+      `INSERT INTO server_member_roles (server_id, user_id, role_id)
+       VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+      [s.id, ownerId, memberRole.id],
+    );
+
     return s;
+  }
+
+  private async assignMemberRole(serverId: string, userId: string): Promise<void> {
+    const [memberRole] = await this.db.query<{ id: string }>(
+      `SELECT id FROM server_roles WHERE server_id=$1 AND name='Member' LIMIT 1`,
+      [serverId],
+    );
+    if (!memberRole) return;
+    await this.db.query(
+      `INSERT INTO server_member_roles (server_id, user_id, role_id)
+       VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+      [serverId, userId, memberRole.id],
+    );
   }
 
   async join(serverId: string, userId: string): Promise<{ ok: true }> {
@@ -45,6 +72,7 @@ export class ServersService {
       'INSERT INTO server_members (server_id, user_id, role) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING',
       [serverId, userId, 'member'],
     );
+    await this.assignMemberRole(serverId, userId);
     return { ok: true };
   }
 
@@ -95,6 +123,7 @@ export class ServersService {
       'INSERT INTO server_members (server_id, user_id, role) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING',
       [serverId, userId, role],
     );
+    await this.assignMemberRole(serverId, userId);
   }
 
   async listMembers(
